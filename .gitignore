@@ -1,0 +1,14 @@
+# Claude / agent config
+.claude/
+.agents/
+
+# Temp / lock files
+~$*.docx
+*_v2*
+*- 副本*
+
+# Skills
+skills-lock.json
+
+# Reference materials (not source)
+acdemic documents/

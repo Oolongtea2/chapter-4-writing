@@ -1,0 +1,554 @@
+\section{锂矿产可供性评估模型构建}
+
+为实现跨环节指标影响捕捉、环节内动态赋权、全链风险传导溯源，构建"全局共享—指标级交互—环节级融合"的动态时空注意力模型。模型以勘探开采、选矿、冶炼加工、应用、回收五环节链式结构及回收反向反馈为先验约束，自下而上完成指标级因果建模、环节可供性量化、全链风险传导识别，实现从细粒度指标到粗粒度环节的层级化风险溯源与可供性评估。模型总体架构如图\ref{fig:model_architecture}所示。
+
+\subsection{问题定义}
+
+锂矿产可供性评估问题可形式化定义如下。
+
+设锂矿产产业链由 $K=5$ 个环节构成，记为 $\mathcal{L}=\{L_1,L_2,L_3,L_4,L_5\}$，分别对应勘探开采、选矿、冶炼加工、应用、回收环节。每个环节 $L_k$ 包含 $m_k$ 个可供性监测指标，全链共计 $M=\sum_{k=1}^{K} m_k$ 个指标。每个环节 $L_k$ 进一步划分为 $D_k$ 个评价维度，记为 $\mathcal{D}_k=\{D_{k,1},D_{k,2},\ldots,D_{k,D_k}\}$，维度 $D_{k,d}$ 包含 $n_{k,d}$ 个指标。令 $\mathcal{I}_{k,d}\subseteq\{1,\ldots,m_k\}$ 为环节 $k$ 内属于维度 $d$ 的指标索引集合，满足 $\bigcup_{d=1}^{D_k}\mathcal{I}_{k,d}=\{1,\ldots,m_k\}$ 且各维度指标集合互不相交。对任意离散时间步 $t$，第 $k$ 个环节的第 $i$ 个指标的状态值记为 $x_{k,i}^{(t)}\in\mathbb{R}$，则该环节的指标向量为 $\mathbf{x}_k^{(t)}=[x_{k,1}^{(t)},x_{k,2}^{(t)},\ldots,x_{k,m_k}^{(t)}]^{\top}\in\mathbb{R}^{m_k}$。全链在时间步 $t$ 的全局特征矩阵为：
+
+\begin{equation}
+\mathbf{X}^{(t)}=\begin{bmatrix}
+\mathbf{x}_1^{(t)} \\
+\mathbf{x}_2^{(t)} \\
+\vdots \\
+\mathbf{x}_K^{(t)}
+\end{bmatrix}\in\mathbb{R}^{M\times 1}
+\end{equation}
+
+给定过去 $T$ 个时间步的历史观测序列 $\mathcal{X}^{(T)}=[\mathbf{X}^{(t-T+1)},\mathbf{X}^{(t-T+2)},\ldots,\mathbf{X}^{(t)}]\in\mathbb{R}^{M\times T}$，模型旨在学习一个映射函数 $\mathcal{F}(\cdot)$，联合完成以下三项任务：
+
+\textbf{任务一：环节级可供性评估（Link-level Availability Assessment）。}评估各环节及其内部维度在当前时间步的可供性得分。对于环节 $L_k$，输出维度可供性得分向量 $\mathbf{d}_k^{(t)}=[d_{k,1}^{(t)},d_{k,2}^{(t)},\ldots,d_{k,D_k}^{(t)}]^{\top}\in[0,1]^{D_k}$ 及环节可供性得分 $a_k^{(t)}\in[0,1]$，其中 $d_{k,d}^{(t)}$ 表征维度 $D_{k,d}$ 的可供性水平，$a_k^{(t)}$ 由维度得分聚合得到，表征环节 $L_k$ 的整体可供性水平。全链环节可供性向量记为 $\mathbf{A}^{(t)}=[a_1^{(t)},a_2^{(t)},\ldots,a_K^{(t)}]^{\top}\in[0,1]^{K}$。
+
+\textbf{任务二：全链整体可供性评估（Overall Availability Assessment）。}基于环节级可供性得分，通过全链融合机制输出整体可供性评分 $A_{\text{overall}}^{(t)}\in[0,1]$，综合反映锂矿产全产业链的供给保障能力。
+
+\textbf{任务三：风险溯源与传导识别（Risk Tracing and Transmission Identification）。}识别导致全链可供性下降的关键风险指标及其在产业链中的传导路径，输出风险传导路径集合 $\mathcal{P}_{\text{risk}}=\{p_1,p_2,\ldots\}$ 及各路径的风险贡献度 $\mathbf{w}_{\text{risk}}$。
+
+综上，学习目标为基于历史观测 $\mathcal{X}^{(T)}$ 优化模型参数 $\Theta$，得到联合输出：
+
+\begin{equation}
+(\mathbf{A}^{(t)}, A_{\text{overall}}^{(t)}, \mathcal{P}_{\text{risk}}, \mathbf{w}_{\text{risk}}) = \mathcal{F}(\mathcal{X}^{(T)}; \Theta)
+\end{equation}
+
+\subsection{动态时空注意力评估模型}
+
+\subsubsection{总体架构}
+
+模型采用"全局共享—指标级交互—环节级融合"三层递进式架构，自下而上完成特征编码、跨环节交互建模、环节内动态赋权及全链注意力融合。数据流遵循以下路径：
+
+\begin{enumerate}
+\item \textbf{全局共享特征层：}对全链 $M$ 个异源监测指标及 LLM 提取的文本衍生特征进行方向性归一化、输入嵌入与时序位置编码，并通过双向 GRU 捕捉各指标在 $T$ 步观测窗口内的时序依赖关系，构建融合时序动态信息与文本语义的统一特征空间 $\mathbf{H}^{(0)}\in\mathbb{R}^{M\times d_{\text{model}}}$，为跨环节交互提供输入基础。
+\item \textbf{跨环节指标交互层：}基于链式传导与回收反馈的先验关系构建指标级有向图结构，采用多头图注意力网络（Multi-Head GAT）捕捉跨环节指标间的非线性因果关联，输出交互增强特征 $\mathbf{H}^{\text{GAT}}\in\mathbb{R}^{M\times d_{\text{model}}}$。
+\item \textbf{环节内动态赋权层：}针对每个环节 $L_k$，依次通过动态权重网络（DWN）与通道注意力机制（SENet）对环节内各指标进行自适应赋权，经维度池化生成维度表征与维度可供性得分 $d_{k,d}^{(t)}$，再聚合为环节表征向量 $\mathbf{z}_k\in\mathbb{R}^{d_{\text{model}}}$。
+\item \textbf{全链条注意力融合层：}采用多头注意力机制对 $K$ 个环节表征进行全局融合，输出全链整体可供性评分 $A_{\text{overall}}^{(t)}$，并通过注意力权重分析实现风险传导路径溯源。
+\end{enumerate}
+
+\subsubsection{文本特征LLM提取}
+\label{sec:text_llm}
+
+锂矿产可供性评估的数据源除结构化数值指标外，还包含大量非结构化文本信息，包括政策法规文本（采矿权管理、出口配额调整、环保标准修订等）、行业市场报告（供需分析、价格展望）、突发事件新闻（矿山停产、地缘冲突、技术突破）以及技术进展文献。这些文本蕴含对可供性状态与趋势的丰富语义信号，但其非结构化形式无法直接纳入基于标量输入的模型 pipeline。为此，引入大语言模型（Large Language Model, LLM）作为预处理阶段的特征提取器，将文本转换为结构化标量特征，以与数值指标完全相同的通道输入模型。
+
+\textbf{(1) LLM提取流程。}
+
+对每条文本 $T_m$（附时间戳 $\tau_m$），构造领域导向的提取指令（prompt），要求 LLM 输出预定义维度的结构化评估结果。以政策文本为例：
+
+\begin{quote}
+\textit{``你是一位锂矿产产业链分析师。请阅读以下政策文本，评估其对锂矿产产业链 5 个环节（勘探开采、选矿、冶炼加工、应用、回收）的影响： (1) 判断影响方向（+1=正向促进，-1=负向抑制，0=无影响）；(2) 评估影响强度（0--5 分）。以 JSON 格式输出。''}
+\end{quote}
+
+LLM 按指定 schema 输出结构化结果，每条文本对应一个多维特征向量 $\mathbf{s}_m \in \mathbb{R}^{d_{\text{text}}}$，其中 $d_{\text{text}}$ 为预先定义的提取维度总数。对于不同类型文本，提取维度按需定制：市场报告类提取供给紧张指数、价格趋势方向、需求增速信号等；事件新闻类提取事件类型 one-hot 编码、严重程度等级、影响持续性估计等。
+
+\textbf{(2) 时序对齐与指标融合。}
+
+将文本提取特征按时间戳 $\tau_m$ 对齐至离散时间步 $t' \in \{t-T+1,\ldots,t\}$。对时间步 $t'$ 内的全部文本提取特征取均值，得到该步的文本衍生特征向量：
+
+\begin{equation}
+\mathbf{s}^{(t')} = \frac{1}{|\mathcal{M}_{t'}|} \sum_{m \in \mathcal{M}_{t'}} \mathbf{s}_m \in \mathbb{R}^{d_{\text{text}}}
+\end{equation}
+
+其中 $\mathcal{M}_{t'} = \{m \mid \tau_m \in \text{bin}(t')\}$ 为时间步 $t'$ 内的文本集合。若某时间步无文本，$\mathbf{s}^{(t')}$ 以前一有效时间步的值填充。
+
+将文本衍生特征按维度归属映射至对应环节，与数值指标向量拼接，形成扩展的环节特征向量：
+
+\begin{equation}
+\tilde{\mathbf{x}}_k^{\text{ext},(t')} = \left[\tilde{\mathbf{x}}_k^{(t')}; \mathbf{s}_k^{(t')}\right] \in \mathbb{R}^{m_k + d_{\text{text},k}}
+\end{equation}
+
+其中 $\mathbf{s}_k^{(t')} \in \mathbb{R}^{d_{\text{text},k}}$ 为环节 $L_k$ 对应的文本衍生特征片段，$\sum_{k=1}^{K} d_{\text{text},k} = d_{\text{text}}$。扩展后的全链特征向量记为 $\tilde{\mathbf{X}}^{\text{ext},(t')} \in \mathbb{R}^{M + d_{\text{text}}}$，直接进入后续的输入嵌入与 BiGRU 时序编码流程。
+
+\textbf{(3) 一致性与可靠性保障。}
+
+为保证 LLM 特征提取的可重复性，采用以下策略：(a) 固定 temperature=0 以消除采样随机性；(b) 要求结构化 JSON 输出并配合正则校验，确保格式与值域合规；(c) 对每条文本独立调用三次取中位数，滤除偶发异常输出；(d) 领域专家抽取 $10\%$ 样本进行人工校验，计算 LLM 提取结果与专家标注的 Spearman 相关系数，确保提取质量达到可用阈值（$\rho > 0.8$）。
+
+经 LLM 提取与对齐后的文本衍生特征以标量形式无缝融入现有指标体系，模型架构的后续组件（BiGRU、GAT、DWN+SENet、全链融合）无需任何改动。该设计将 LLM 定位于数据预处理层而非模型推理路径的组成部分，既利用了 LLM 的语义理解与零样本提取能力，又不引入额外的端到端训练复杂度。
+
+\subsubsection{全局共享特征层}
+
+该层旨在整合全链多源监测指标与文本衍生特征并捕捉各指标的时序依赖关系，构建融合时序动态信息的全局统一特征空间，为跨环节交互提供输入基础。文本特征经 LLM 预处理提取后（见第 \ref{sec:text_llm} 节），以扩展标量形式与数值指标拼接，具体包括指标方向性归一化、输入嵌入与时序位置编码、时序特征编码三个步骤。
+
+\textbf{(1) 指标方向性归一化。}
+
+锂矿产可供性指标具有异质性量纲和双向影响属性。根据指标对可供性的作用方向，将其划分为正向指标（值越大可供性越高，如资源储量、产能利用率）和负向指标（值越大可供性越低，如开采成本、环境风险指数）。采用极差归一化（Min-Max Normalization）将各指标映射至 $[0,1]$ 区间：
+
+\begin{equation}
+\tilde{x}_{k,i}^{(t)} =
+\begin{cases}
+\dfrac{x_{k,i}^{(t)} - x_{k,i}^{\min}}{x_{k,i}^{\max} - x_{k,i}^{\min}}, & \text{若 } x_{k,i} \text{ 为正向指标} \\[12pt]
+\dfrac{x_{k,i}^{\max} - x_{k,i}^{(t)}}{x_{k,i}^{\max} - x_{k,i}^{\min}}, & \text{若 } x_{k,i} \text{ 为负向指标}
+\end{cases}
+\end{equation}
+
+其中 $x_{k,i}^{\max}=\max_t x_{k,i}^{(t)}$ 和 $x_{k,i}^{\min}=\min_t x_{k,i}^{(t)}$ 分别为指标 $i$ 在观测窗口内的最大值和最小值。归一化后，$\tilde{x}_{k,i}^{(t)}\in[0,1]$ 且取值越大代表可供性越高，从而消除指标方向性差异，确保全局特征空间内所有特征值具有一致的正向语义。
+
+归一化后的全链全局特征向量记为：
+
+\begin{equation}
+\tilde{\mathbf{X}}^{(t)} = [\tilde{\mathbf{x}}_1^{(t)}; \tilde{\mathbf{x}}_2^{(t)}; \ldots; \tilde{\mathbf{x}}_K^{(t)}] \in \mathbb{R}^{M}
+\end{equation}
+
+其中 $[\cdot;\cdot]$ 表示向量拼接操作，$\tilde{\mathbf{x}}_k^{(t)}=[\tilde{x}_{k,1}^{(t)},\tilde{x}_{k,2}^{(t)},\ldots,\tilde{x}_{k,m_k}^{(t)}]^{\top}\in\mathbb{R}^{m_k}$。
+
+\textbf{(2) 输入嵌入与时序位置编码。}
+
+对观测窗口内的每个时间步 $t' \in \{t-T+1,\ldots,t\}$，将各指标的归一化标量值通过跨指标共享的全连接层投影至 $d_{\text{model}}$ 维空间，并注入时序位置编码以标记各时间步在窗口中的相对位置：
+
+\begin{equation}
+\mathbf{e}_i^{(t')} = \text{Linear}\left(\tilde{x}_i^{(t')}\right) + \mathbf{p}^{\text{temp}}(t'), \quad i=1,2,\ldots,M
+\end{equation}
+
+其中 $\text{Linear}(\cdot):\mathbb{R}^{1}\to\mathbb{R}^{d_{\text{model}}}$ 为跨指标共享的线性投影层。$\mathbf{p}^{\text{temp}}(t')\in\mathbb{R}^{d_{\text{model}}}$ 为时序位置编码，采用正弦-余弦编码设计：
+
+\begin{equation}
+\mathbf{p}_{2j}^{\text{temp}}(t') = \sin\left(\frac{\text{pos}(t')}{10000^{2j/d_{\text{model}}}}\right), \quad
+\mathbf{p}_{2j+1}^{\text{temp}}(t') = \cos\left(\frac{\text{pos}(t')}{10000^{2j/d_{\text{model}}}}\right)
+\end{equation}
+
+其中 $\text{pos}(t') = t' - (t-T+1) \in \{0,1,\ldots,T-1\}$ 为时间步 $t'$ 在观测窗口内的相对位置，$j$ 为维度索引。该编码使模型能够区分序列中的"远近"关系——越靠近当前时刻 $t$ 的时间步获得越大的位置索引值，符合近期信息对当前可供性判断影响更大的先验假设。
+
+由此，每个指标 $i$ 在 $T$ 步观测窗口内形成嵌入向量序列：
+
+\begin{equation}
+\mathcal{E}_i = \left[\mathbf{e}_i^{(t-T+1)},\mathbf{e}_i^{(t-T+2)},\ldots,\mathbf{e}_i^{(t)}\right] \in \mathbb{R}^{d_{\text{model}} \times T}
+\end{equation}
+
+\textbf{(3) 时序特征编码。}
+
+为捕捉各指标在观测窗口内的时序依赖关系（如趋势演化、周期波动、突发异常等），对每个指标的嵌入序列 $\mathcal{E}_i$ 采用双向 GRU（Bidirectional Gated Recurrent Unit）进行时序建模。GRU 相比 LSTM 参数更少、收敛更快，适合中等长度的时序窗口；双向扫描确保每个时间步的编码同时融合过去与未来的上下文信息。
+
+将 $\mathcal{E}_i$ 按时序展开，输入跨指标共享权重的 BiGRU：
+
+\begin{equation}
+\overrightarrow{\mathbf{h}}_i^{(t')} = \text{GRU}_{\text{fwd}}\left(\mathbf{e}_i^{(t')}, \overrightarrow{\mathbf{h}}_i^{(t'-1)}\right), \quad
+\overleftarrow{\mathbf{h}}_i^{(t')} = \text{GRU}_{\text{bwd}}\left(\mathbf{e}_i^{(t')}, \overleftarrow{\mathbf{h}}_i^{(t'+1)}\right)
+\end{equation}
+
+取前向 GRU 在窗口末端的隐状态与反向 GRU 在窗口始端的隐状态，拼接为指标 $i$ 的时序聚合表征：
+
+\begin{equation}
+\mathbf{h}_i^{\text{temp}} = \left[\overrightarrow{\mathbf{h}}_i^{(t)}; \overleftarrow{\mathbf{h}}_i^{(t-T+1)}\right] \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+其中 GRU 隐层维度设为 $d_{\text{model}}/2$，确保拼接后维度仍为 $d_{\text{model}}$。$\mathbf{h}_i^{\text{temp}}$ 凝练了指标 $i$ 在 $T$ 步窗口内的全部时序动态信息——包括趋势方向、波动幅度、异常时刻等关键时序模式。
+
+最后，注入环节感知的位置编码以保留产业链的结构先验，使后续跨环节 GAT 能够区分不同环节的指标节点：
+
+\begin{equation}
+\mathbf{h}_i^{(0)} = \mathbf{h}_i^{\text{temp}} + \mathbf{p}_i^{\text{stage}} \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+其中环节位置编码 $\mathbf{p}_i^{\text{stage}}$ 采用正弦-余弦编码：
+
+\begin{equation}
+\mathbf{p}_{i,2j}^{\text{stage}} = \sin\left(\frac{\text{link}(i)}{10000^{2j/d_{\text{model}}}}\right), \quad
+\mathbf{p}_{i,2j+1}^{\text{stage}} = \cos\left(\frac{\text{link}(i)}{10000^{2j/d_{\text{model}}}}\right)
+\end{equation}
+
+$\text{link}(i)\in\{1,2,3,4,5\}$ 为指标 $i$ 所属环节的索引。至此，得到融合了时序动态与结构先验的初始嵌入矩阵：
+
+\begin{equation}
+\mathbf{H}^{(0)} = \left[\mathbf{h}_1^{(0)},\mathbf{h}_2^{(0)},\ldots,\mathbf{h}_M^{(0)}\right]^{\top} \in \mathbb{R}^{M \times d_{\text{model}}}
+\end{equation}
+
+$\mathbf{H}^{(0)}$ 作为跨环节指标交互层的输入，其中每个指标节点特征已编码了该指标在过去 $T$ 步内的时序演化模式。
+
+\subsubsection{跨环节指标交互层}
+
+该层为模型核心，基于链式传导与回收反馈的先验关系构建指标级图结构，采用多头图注意力网络捕捉跨环节指标间非线性因果关联，解决单环节独立建模导致的特征孤岛化问题。
+
+\textbf{(1) 指标级图结构构建。}
+
+将每个指标视为图的节点，全链 $M$ 个指标构成节点集合 $\mathcal{V}=\{v_1,v_2,\ldots,v_M\}$。边的构建遵循产业链的先验结构约束：
+
+\textbf{前向链式传导边（Forward Chain Edges）：}根据锂矿产的物理流向，上游环节的产出指标通过中间产品向下游环节的接收指标传导。对于环节 $L_k$ 的输出性指标 $v_i$ 与环节 $L_{k+1}$ 的接收性指标 $v_j$，若二者存在投入产出关系，则建立有向边 $v_i\to v_j$：
+
+\begin{equation}
+\mathcal{E}_{\text{forward}} = \{(v_i, v_j) \mid \text{link}(v_i)=k,\ \text{link}(v_j)=k+1,\ \text{conn}(v_i,v_j)=1,\ k=1,2,3,4\}
+\end{equation}
+
+其中 $\text{conn}(v_i,v_j)=1$ 表示指标 $v_i$ 与 $v_j$ 存在投入产出关联。
+
+\textbf{回收反向反馈边（Recycling Feedback Edges）：}回收环节的产出指标（如再生锂产品供给量）反向反馈至冶炼加工和应用环节，形成闭环链路。相应的有向边为：
+
+\begin{equation}
+\mathcal{E}_{\text{recycle}} = \{(v_i, v_j) \mid \text{link}(v_i)=5,\ \text{link}(v_j)\in\{3,4\},\ \text{feedback}(v_i,v_j)=1\}
+\end{equation}
+
+其中 $\text{feedback}(v_i,v_j)=1$ 表示回收指标 $v_i$ 通过再生材料供给反馈影响环节 $\text{link}(v_j)$ 中的指标 $v_j$。
+
+\textbf{环节内自相关边（Intra-link Self-correlation Edges）：}同一环节内部各指标间存在统计相关性，通过计算环节内指标间的皮尔逊相关系数确定连接：
+
+\begin{equation}
+\mathcal{E}_{\text{intra}} = \{(v_i, v_j) \mid \text{link}(v_i)=\text{link}(v_j)=k,\ |\rho_{ij}| > \tau_k,\ i\neq j\}
+\end{equation}
+
+其中 $\rho_{ij}$ 为指标 $v_i$ 与 $v_j$ 在历史窗口内的皮尔逊相关系数，$\tau_k$ 为环节 $k$ 的相关性阈值。由此，图的邻接矩阵 $\mathbf{A}\in\mathbb{R}^{M\times M}$ 定义为：
+
+\begin{equation}
+\mathbf{A}_{ij} = \begin{cases}
+1, & (v_i, v_j) \in \mathcal{E}_{\text{forward}} \cup \mathcal{E}_{\text{recycle}} \cup \mathcal{E}_{\text{intra}} \\
+0, & \text{否则}
+\end{cases}
+\end{equation}
+
+\textbf{(2) 图注意力交互。}
+
+在构建的指标级图结构上，采用多头图注意力网络（Multi-Head GAT）进行节点特征聚合与交互。对于第 $l$ 层 GAT，输入节点特征为 $\mathbf{H}^{(l-1)}=\{\mathbf{h}_1^{(l-1)},\mathbf{h}_2^{(l-1)},\ldots,\mathbf{h}_M^{(l-1)}\}$，$\mathbf{h}_i^{(l-1)}\in\mathbb{R}^{d_{\text{model}}}$。
+
+首先计算节点 $i$ 与其邻居 $j\in\mathcal{N}(i)$ 之间的注意力相似度：
+
+\begin{equation}
+e_{ij}^{(l)} = \text{LeakyReLU}\left(\mathbf{a}^{(l)\top}\left[\mathbf{W}^{(l)}\mathbf{h}_i^{(l-1)} \Vert \mathbf{W}^{(l)}\mathbf{h}_j^{(l-1)}\right]\right)
+\end{equation}
+
+其中 $\mathbf{W}^{(l)}\in\mathbb{R}^{d_{\text{model}}\times d_{\text{model}}}$ 为共享线性变换矩阵，$\mathbf{a}^{(l)}\in\mathbb{R}^{2d_{\text{model}}}$ 为注意力权重向量，$\Vert$ 表示向量拼接，LeakyReLU 的负斜率取 $\alpha=0.2$。邻居集合 $\mathcal{N}(i)=\{j\mid\mathbf{A}_{ij}=1\}\cup\{i\}$ 包含节点 $i$ 自身及其所有邻接节点。
+
+采用 Softmax 归一化得到注意力系数：
+
+\begin{equation}
+\alpha_{ij}^{(l)} = \frac{\exp(e_{ij}^{(l)})}{\sum_{k\in\mathcal{N}(i)}\exp(e_{ik}^{(l)})}
+\end{equation}
+
+为增强模型的稳定性与表达能力，引入多头注意力机制，每个注意力头独立计算注意力系数并进行特征聚合：
+
+\begin{equation}
+\mathbf{h}_i^{(l),s} = \sigma\left(\sum_{j\in\mathcal{N}(i)} \alpha_{ij}^{(l),s} \mathbf{W}^{(l),s} \mathbf{h}_j^{(l-1)}\right)
+\end{equation}
+
+其中 $s=1,2,\ldots,S$ 为注意力头索引，$\sigma(\cdot)$ 为 ELU 激活函数。$S$ 个头的输出通过拼接融合：
+
+\begin{equation}
+\mathbf{h}_i^{(l)} = \mathop{\Vert}\limits_{s=1}^{S} \mathbf{h}_i^{(l),s}
+\end{equation}
+
+经 $L_{\text{GAT}}$ 层堆叠后，得到跨环节交互增强的指标特征矩阵：
+
+\begin{equation}
+\mathbf{H}^{\text{GAT}} = \mathbf{H}^{(L_{\text{GAT}})} = [\mathbf{h}_1^{\text{GAT}},\mathbf{h}_2^{\text{GAT}},\ldots,\mathbf{h}_M^{\text{GAT}}]^{\top} \in \mathbb{R}^{M\times d_{\text{model}}}
+\end{equation}
+
+\textbf{(3) 交互特征输出。}
+
+GAT 层输出的 $\mathbf{H}^{\text{GAT}}$ 融合了邻域的跨环节交互信息。对于环节 $L_k$，其指标交互特征矩阵为：
+
+\begin{equation}
+\mathbf{H}_k^{\text{GAT}} = [\mathbf{h}_{k,1}^{\text{GAT}},\mathbf{h}_{k,2}^{\text{GAT}},\ldots,\mathbf{h}_{k,m_k}^{\text{GAT}}]^{\top} \in \mathbb{R}^{m_k\times d_{\text{model}}}
+\end{equation}
+
+该特征矩阵将作为环节内动态赋权层的输入，用于后续的环节级表征学习。
+
+\subsubsection{环节内动态赋权层}
+
+每个环节内各指标对可供性的贡献权重应随着不同时空场景动态调整。为此设计环节内动态赋权层，由动态权重网络（DWN）和通道注意力机制（SENet）两级模块构成。
+
+\textbf{(1) 动态权重网络（Dynamic Weight Network, DWN）。}
+
+为使模型能够根据不同样本和场景自适应赋权，引入 DWN 对环节 $L_k$ 内 $m_k$ 个指标进行动态加权。将 GAT 交互特征 $\mathbf{H}_k^{\text{GAT}}$ 和环节原始归一化特征 $\tilde{\mathbf{x}}_k$ 共同输入 DWN，通过多层感知机学习各指标的动态权重：
+
+\begin{equation}
+\mathbf{w}_k^{\text{dyn}} = \text{Softmax}\left(\text{MLP}_k^{\text{dwn}}\left(\text{Flatten}\left(\mathbf{H}_k^{\text{GAT}}\right) \Vert \tilde{\mathbf{x}}_k\right)\right)
+\end{equation}
+
+其中 $\text{MLP}_k^{\text{dwn}}:\mathbb{R}^{m_k(d_{\text{model}}+1)}\to\mathbb{R}^{m_k}$ 为环节 $k$ 专属的三层感知机，$\text{Softmax}(\cdot)$ 确保权重之和为 1。$\mathbf{w}_k^{\text{dyn}}=[w_{k,1}^{\text{dyn}},w_{k,2}^{\text{dyn}},\ldots,w_{k,m_k}^{\text{dyn}}]^{\top}\in[0,1]^{m_k}$，$\sum_{i=1}^{m_k} w_{k,i}^{\text{dyn}}=1$。
+
+DWN 的设计使模型能够在不同样本（如不同时间点、不同市场条件）和不同场景（如供应紧张期与宽松期）下自适应调节指标重要性。例如，在供应紧张期，储量类指标的权重将被自动调高；在产能过剩期，成本类指标的权重将占据主导。
+
+DWN 加权后的环节特征矩阵为：
+
+\begin{equation}
+\tilde{\mathbf{H}}_k^{\text{DWN}} = \text{diag}(\mathbf{w}_k^{\text{dyn}}) \cdot \mathbf{H}_k^{\text{GAT}} \in \mathbb{R}^{m_k\times d_{\text{model}}}
+\end{equation}
+
+\textbf{(2) 通道注意力机制（Squeeze-and-Excitation Network, SENet）。}
+
+为进一步增强关键特征通道的表达能力并抑制冗余信息，在 DWN 加权后引入 SENet 对特征通道维度进行自适应校准。
+
+\textbf{Squeeze 阶段：}对加权特征矩阵 $\tilde{\mathbf{H}}_k^{\text{DWN}}$ 的每个通道维度 $d$ 进行全局平均池化，形成通道描述向量：
+
+\begin{equation}
+\mathbf{z}_k^{\text{sq}} = \frac{1}{m_k} \sum_{i=1}^{m_k} \tilde{\mathbf{h}}_{k,i}^{\text{DWN}} \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+\textbf{Excitation 阶段：}将 $\mathbf{z}_k^{\text{sq}}$ 送入双层全连接网络，学习各通道的权重系数：
+
+\begin{equation}
+\mathbf{s}_k = \text{Sigmoid}\left(\mathbf{W}_k^{e2}\cdot\text{ReLU}\left(\mathbf{W}_k^{e1}\cdot\mathbf{z}_k^{\text{sq}} + \mathbf{b}_k^{e1}\right) + \mathbf{b}_k^{e2}\right)
+\end{equation}
+
+其中 $\mathbf{W}_k^{e1}\in\mathbb{R}^{(d_{\text{model}}/r)\times d_{\text{model}}}$ 和 $\mathbf{W}_k^{e2}\in\mathbb{R}^{d_{\text{model}}\times(d_{\text{model}}/r)}$ 为可学习的全连接权重，$r$ 为降维比率（通常取 $r=4$），$\mathbf{s}_k\in(0,1)^{d_{\text{model}}}$ 为通道权重向量。
+
+\textbf{Recalibration 阶段：}将通道权重 $\mathbf{s}_k$ 与 $\tilde{\mathbf{H}}_k^{\text{DWN}}$ 逐通道相乘，并做残差连接：
+
+\begin{equation}
+\mathbf{H}_k^{\text{SENet}} = \tilde{\mathbf{H}}_k^{\text{DWN}} \odot \mathbf{s}_k + \mathbf{H}_k^{\text{GAT}}
+\end{equation}
+
+其中 $\odot$ 表示逐通道的 Hadamard 积（广播至 $m_k$ 个指标）。残差连接确保在通道重标定过程中保留原始交互特征的信息流。
+
+\textbf{(3) 维度表征与维度可供性得分。}
+
+为支撑细粒度的维度级结果分析，在环节内按维度对 SENet 校准后的指标特征进行分组池化，生成各维度的表征向量。对于环节 $L_k$ 的维度 $d$：
+
+\begin{equation}
+\mathbf{z}_{k,d} = \frac{1}{n_{k,d}} \sum_{i\in\mathcal{I}_{k,d}} \mathbf{h}_{k,i}^{\text{SENet}} \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+其中 $\mathcal{I}_{k,d}$ 为维度 $d$ 内的指标索引集合，$n_{k,d}=|\mathcal{I}_{k,d}|$。$\mathbf{z}_{k,d}$ 聚合了维度 $d$ 内所有指标经跨环节交互与动态赋权后的特征信息。
+
+基于维度表征，通过维度专属评分网络生成维度可供性得分：
+
+\begin{equation}
+d_{k,d}^{(t)} = \text{Sigmoid}\left(\text{MLP}_{k,d}^{\text{dim}}\left(\mathbf{z}_{k,d}\right)\right) \in (0,1)
+\end{equation}
+
+其中 $\text{MLP}_{k,d}^{\text{dim}}:\mathbb{R}^{d_{\text{model}}}\to\mathbb{R}^{1}$ 为环节 $k$ 维度 $d$ 的专属评分网络。维度得分 $d_{k,d}^{(t)}$ 可直接用于后续结果分析中按维度拆解各环节的可供性强弱分布。
+
+\textbf{(4) 环节表征与环节得分聚合。}
+
+在维度表征基础上，经维度平均池化与环节评分网络生成环节级表征和可供性得分：
+
+\begin{equation}
+\mathbf{z}_k = \frac{1}{D_k} \sum_{d=1}^{D_k} \mathbf{z}_{k,d} \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+\begin{equation}
+a_k^{(t)} = \text{Sigmoid}\left(\text{MLP}_k^{\text{out}}\left(\mathbf{z}_k\right)\right) \in (0,1)
+\end{equation}
+
+该设计实现了"指标→维度→环节"的自底向上层级聚合：维度得分 $d_{k,d}^{(t)}$ 保留环节内部的细粒度差异信息，供维度级分析使用；环节得分 $a_k^{(t)}$ 则作为环节整体的可供性摘要，输入后续的全链融合层。
+
+由此得到所有环节的维度得分矩阵 $\mathbf{D}^{(t)}=\{\mathbf{d}_k^{(t)}\}_{k=1}^{K}$、环节表征矩阵 $\mathbf{Z}=[\mathbf{z}_1,\mathbf{z}_2,\ldots,\mathbf{z}_K]^{\top}\in\mathbb{R}^{K\times d_{\text{model}}}$ 和环节可供性向量 $\mathbf{A}^{(t)}=[a_1^{(t)},\ldots,a_K^{(t)}]^{\top}$。
+
+\subsubsection{全链条注意力融合层}
+
+该层以环节表征 $\mathbf{Z}$ 为输入，通过多头注意力机制实现环节间的全局信息融合，输出全链整体可供性评分，并基于注意力权重实现风险溯源与传导路径识别。
+
+\textbf{(1) 多头注意力融合。}
+
+采用多头自注意力（Multi-Head Self-Attention, MHA）机制对 $K$ 个环节的表征进行全局交互。以整个环节表征矩阵 $\mathbf{Z}$ 为输入，通过可学习投影矩阵生成 Query、Key、Value：
+
+\begin{equation}
+\mathbf{Q}_h = \mathbf{Z}\mathbf{W}_h^Q, \quad \mathbf{K}_h = \mathbf{Z}\mathbf{W}_h^K, \quad \mathbf{V}_h = \mathbf{Z}\mathbf{W}_h^V
+\end{equation}
+
+其中 $\mathbf{W}_h^Q,\mathbf{W}_h^K,\mathbf{W}_h^V\in\mathbb{R}^{d_{\text{model}}\times d_k}$ 为第 $h$ 个注意力头的投影矩阵，$d_k = d_{\text{model}}/H$，$H$ 为注意力头数。
+
+缩放点积注意力计算：
+
+\begin{equation}
+\text{Attention}_h(\mathbf{Q}_h,\mathbf{K}_h,\mathbf{V}_h) = \text{Softmax}\left(\frac{\mathbf{Q}_h\mathbf{K}_h^{\top}}{\sqrt{d_k}}\right)\mathbf{V}_h
+\end{equation}
+
+$H$ 个头的结果拼接后经线性投影得到多头注意力输出：
+
+\begin{equation}
+\mathbf{Z}^{\text{MHA}} = \left(\mathop{\Vert}\limits_{h=1}^{H} \text{Attention}_h(\mathbf{Q}_h,\mathbf{K}_h,\mathbf{V}_h)\right)\mathbf{W}^O \in \mathbb{R}^{K\times d_{\text{model}}}
+\end{equation}
+
+其中 $\mathbf{W}^O\in\mathbb{R}^{d_{\text{model}}\times d_{\text{model}}}$ 为输出投影矩阵。经残差连接和层归一化得到融合后的环节表征：
+
+\begin{equation}
+\tilde{\mathbf{Z}} = \text{LayerNorm}\left(\mathbf{Z} + \mathbf{Z}^{\text{MHA}}\right) \in \mathbb{R}^{K\times d_{\text{model}}}
+\end{equation}
+
+\textbf{全链可供性评分。}将融合后的环节表征经全局平均池化和 MLP 映射得到整体可供性：
+
+\begin{equation}
+\mathbf{z}_{\text{global}} = \frac{1}{K} \sum_{k=1}^{K} \tilde{\mathbf{z}}_k \in \mathbb{R}^{d_{\text{model}}}
+\end{equation}
+
+\begin{equation}
+A_{\text{overall}}^{(t)} = \text{Sigmoid}\left(\text{MLP}_{\text{global}}\left(\mathbf{z}_{\text{global}}\right)\right) \in (0,1)
+\end{equation}
+
+\textbf{(2) 风险溯源与传导识别。}
+
+利用多头注意力机制中固有的注意力权重矩阵，实现从全链可供性到具体风险指标的可追溯解译。
+
+\textbf{环节间注意力权重提取。}对 $H$ 个头求平均，得到环节间的平均注意力矩阵：
+
+\begin{equation}
+\bar{\boldsymbol{\alpha}}^{\text{link}} = \frac{1}{H} \sum_{h=1}^{H} \text{Softmax}\left(\frac{\mathbf{Q}_h\mathbf{K}_h^{\top}}{\sqrt{d_k}}\right) \in \mathbb{R}^{K\times K}
+\end{equation}
+
+其中 $\bar{\alpha}_{ij}^{\text{link}}$ 表征环节 $L_j$ 对环节 $L_i$ 可供性评估的注意力权重。对于全链整体可供性输出端，定义全局查询向量 $\mathbf{q}_{\text{global}}\in\mathbb{R}^{d_{\text{model}}}$，计算各环节对整体可供性的贡献权重：
+
+\begin{equation}
+\boldsymbol{\beta}^{\text{global}} = \text{Softmax}\left(\frac{\mathbf{q}_{\text{global}}\tilde{\mathbf{Z}}^{\top}}{\sqrt{d_{\text{model}}}}\right) \in \mathbb{R}^{K}
+\end{equation}
+
+其中 $\beta_k^{\text{global}}$ 表示环节 $L_k$ 对全链整体可供性的相对贡献度。
+
+\textbf{风险传导路径识别。}给定风险阈值 $\lambda_{\text{risk}}$，当 $A_{\text{overall}}^{(t)} < \lambda_{\text{risk}}$ 时，触发风险溯源流程：
+
+\begin{enumerate}
+\item \textbf{定位薄弱环节：}选取 $\beta_k^{\text{global}}$ 最低的环节作为薄弱环节 $L_{k^*}$：
+\begin{equation}
+k^* = \arg\min_k \beta_k^{\text{global}}
+\end{equation}
+
+\item \textbf{识别传导来源：}基于 $\bar{\boldsymbol{\alpha}}^{\text{link}}$，追溯对薄弱环节 $L_{k^*}$ 注意力权重最大的上游环节序列，构建风险传导路径。沿链式结构逐级回溯：
+\begin{equation}
+p = \{L_{k_0} \to L_{k_1} \to \cdots \to L_{k^*}\}
+\end{equation}
+其中 $L_{k_j}$ 为 $L_{k_{j+1}}$ 注意力权重最大的上游环节：$k_{j}=\arg\max_{i<k_{j+1}} \bar{\alpha}_{k_{j+1},i}^{\text{link}}$。
+
+\item \textbf{归因至指标：}在薄弱环节 $L_{k^*}$ 内，基于 DWN 权重 $\mathbf{w}_{k^*}^{\text{dyn}}$ 定位贡献度最低的指标作为风险根因指标：
+\begin{equation}
+i^* = \arg\min_i w_{k^*,i}^{\text{dyn}}
+\end{equation}
+\end{enumerate}
+
+\textbf{风险传导强度。}沿传导路径 $p$，定义路径级风险传导强度为路径上各环节间注意力权重的累积：
+
+\begin{equation}
+R(p) = \prod_{(i,j)\in p} \bar{\alpha}_{ji}^{\text{link}}
+\end{equation}
+
+$R(p)$ 越大表明该传导路径在当前状态下对全链可供性的影响越显著。
+
+\subsection{SHAP可靠性验证体系构建}
+
+虽然注意力机制中权重变化的可视化能够一定程度上解释影响锂矿产可供性的产业链环节和维度，但注意力权重仅反映模型内部的相对关注度，无法验证结果的统计有效性和真实因果关系。为此构建基于 SHAP（SHapley Additive exPlanations）的多层验证体系，覆盖维度级与环节级动态权重的有效性验证，并聚焦于模型核心输出——全链整体可供性与风险溯源结果的因果验证，确保风险评估与决策支持的科学性。
+
+\subsubsection{维度、环节及整体可供性的SHAP验证}
+
+SHAP 基于合作博弈论中的 Shapley 值，度量每个输入特征对模型预测结果的边际贡献。对于模型输出的可供性评分 $f(\mathbf{x})$（可为环节级 $a_k^{(t)}$ 或整体级 $A_{\text{overall}}^{(t)}$），特征 $j$ 的 SHAP 值定义为：
+
+\begin{equation}
+\phi_j(f) = \sum_{S\subseteq\mathcal{F}\setminus\{j\}} \frac{|S|!(M-|S|-1)!}{M!}\left[f(\mathbf{x}_{S\cup\{j\}}) - f(\mathbf{x}_S)\right]
+\end{equation}
+
+其中 $\mathcal{F}$ 为全部 $M$ 个指标的特征集合，$S$ 为不包含特征 $j$ 的特征子集，$f(\mathbf{x}_S)$ 为仅使用特征子集 $S$ 的模型输出。SHAP 值 $\phi_j$ 的正负号表征影响方向（正推动可供性升高，负推动可供性降低），绝对值 $|\phi_j|$ 表征影响强度。
+
+\textbf{环节级SHAP验证。}针对每个环节 $L_k$ 的可供性评分 $a_k^{(t)}$，计算环节内 $m_k$ 个指标的 SHAP 值 $\{\phi_{k,i}\}_{i=1}^{m_k}$，验证 DWN 动态权重 $\mathbf{w}_k^{\text{dyn}}$ 与 SHAP 贡献度的一致性。定义权重-SHAP一致性指标：
+
+\begin{equation}
+\rho_k^{\text{cons}} = \text{SpearmanCorr}\left(\mathbf{w}_k^{\text{dyn}},\ |\boldsymbol{\phi}_k|\right) \in [-1,1]
+\end{equation}
+
+其中 $\boldsymbol{\phi}_k = [\phi_{k,1},\ldots,\phi_{k,m_k}]^{\top}$。$\rho_k^{\text{cons}}$ 越接近 $1$，表明 DWN 学得的动态权重与 SHAP 识别的特征重要性越一致，验证了动态赋权的可靠性。
+
+\textbf{维度级SHAP验证。}基于 SHAP 值的可加性，将环节内各指标的 SHAP 值按维度聚合，得到维度 SHAP 贡献：
+
+\begin{equation}
+\Phi_{k,d}^{\text{shap}} = \sum_{i\in\mathcal{I}_{k,d}} \phi_{k,i}, \quad d=1,2,\ldots,D_k
+\end{equation}
+
+$\Phi_{k,d}^{\text{shap}}$ 表征维度 $D_{k,d}$ 内全部指标对环节可供性 $a_k^{(t)}$ 的净 SHAP 贡献。定义维度级权重-SHAP一致性指标：
+
+\begin{equation}
+\rho_{k,d}^{\text{cons}} = \text{SpearmanCorr}\left(\{w_{k,i}^{\text{dyn}}\}_{i\in\mathcal{I}_{k,d}},\ \{|\phi_{k,i}|\}_{i\in\mathcal{I}_{k,d}}\right) \in [-1,1]
+\end{equation}
+
+$\rho_{k,d}^{\text{cons}}$ 用于验证各维度内部 DWN 权重与 SHAP 特征重要性的一致程度。维度 SHAP 贡献 $\Phi_{k,d}^{\text{shap}}$ 可在结果分析中按维度拆解各环节的可供性强弱来源，支撑维度级的诊断与归因。
+
+\textbf{整体级SHAP验证。}针对全链整体可供性评分 $A_{\text{overall}}^{(t)}$，计算全部 $M$ 个指标的全局 SHAP 值，识别对全链可供性影响最大的 Top-$N$ 风险因子：
+
+\begin{equation}
+\mathcal{I}_{\text{top}} = \underset{i}{\text{TopK}}\left(|\phi_i|,\ N\right)
+\end{equation}
+
+同时基于 SHAP 依赖图分析关键指标与可供性评分的非线性响应关系：
+
+\begin{equation}
+\text{SHAP}_j(x_j) = \mathbb{E}[\phi_j \mid x_j = v]
+\end{equation}
+
+该式表示给定指标 $j$ 的取值为 $v$ 时的条件期望 SHAP 值，可揭示指标在不同取值区间对可供性的差异化影响模式（如阈值效应、边际递减等）。
+
+\textbf{环节贡献分解。}基于 SHAP 值的可加性，将整体可供性的 SHAP 总效应按环节分解：
+
+\begin{equation}
+\Phi_k = \sum_{i\in L_k} \phi_i,\quad \sum_{k=1}^{K} \Phi_k + \phi_0 = A_{\text{overall}}^{(t)}
+\end{equation}
+
+其中 $\Phi_k$ 为环节 $L_k$ 内所有指标的 SHAP 值之和，$\phi_0$ 为基础值（Base Value）。$\Phi_k$ 可直观反映各环节对整体可供性的净贡献。
+
+\subsubsection{风险溯源结果的反事实验证}
+
+注意力机制揭示的风险传导路径需要验证其反映的是真实因果关系而非统计相关性。为此构建基于反事实干预（Counterfactual Intervention）的验证框架。
+
+\textbf{反事实生成。}对模型识别出的薄弱环节 $L_{k^*}$ 及其根因指标 $i^*$，构建反事实样本：在保持其他指标不变的前提下，将指标 $i^*$ 的值替换为历史正常时期的均值 $\bar{x}_{k^*,i^*}^{\text{normal}}$：
+
+\begin{equation}
+\mathbf{x}^{\text{cf}} = \mathbf{x} \quad \text{except} \quad x_{k^*,i^*}^{\text{cf}} = \bar{x}_{k^*,i^*}^{\text{normal}}
+\end{equation}
+
+\textbf{个体因果效应（Individual Causal Effect, ICE）。}定义为反事实干预前后模型整体可供性预测值的差异：
+
+\begin{equation}
+\text{ICE}(i^*) = A_{\text{overall}}(\mathbf{x}^{\text{cf}}) - A_{\text{overall}}(\mathbf{x})
+\end{equation}
+
+若 $\text{ICE}(i^*) > 0$ 且 $|\text{ICE}(i^*)| > \delta_{\text{sig}}$（$\delta_{\text{sig}}$ 为显著性阈值），表明修复该指标可有效提升全链可供性，验证了风险溯源结果的因果真实性。
+
+\textbf{传导路径验证。}对风险传导路径 $p=\{L_{k_0}\to\cdots\to L_{k^*}\}$ 上的每个中间环节，依次进行反事实干预并计算因果效应衰减率：
+
+\begin{equation}
+\gamma_{k_j\to k_{j+1}} = \frac{\text{ICE}(\text{fix }L_{k_j})}{\text{ICE}(\text{fix }L_{k_{j+1}})}
+\end{equation}
+
+其中 $\text{ICE}(\text{fix }L_{k_j})$ 表示修复环节 $L_{k_j}$ 全部异常指标后的因果效应。$\gamma_{k_j\to k_{j+1}} < 1$ 表明风险沿上下游方向递减传导，符合产业链物理规律；若 $\gamma_{k_j\to k_{j+1}}$ 异常偏离 1，则提示可能存在模型未捕捉到的隐藏风险传导机制。
+
+\textbf{平均因果效应（Average Causal Effect, ACE）。}在测试集的全部异常样本上，计算根因指标修复的平均因果效应：
+
+\begin{equation}
+\text{ACE}(i^*) = \frac{1}{N_{\text{anom}}} \sum_{n=1}^{N_{\text{anom}}} \text{ICE}_n(i^*)
+\end{equation}
+
+ACE 的正负号与幅值可综合评估风险溯源路径在统计意义上的因果有效性和修复收益。
+
+\subsection{损失函数与优化策略}
+
+模型的总损失函数由可供性评估损失、环节赋权正则化损失和SHAP一致性引导损失三部分加权构成：
+
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{avail}} + \lambda_1\mathcal{L}_{\text{reg}} + \lambda_2\mathcal{L}_{\text{shap}}
+\end{equation}
+
+\textbf{(1) 可供性评估损失 $\mathcal{L}_{\text{avail}}$。}包含维度级、环节级和整体级三类监督信号：
+
+\begin{equation}
+\mathcal{L}_{\text{avail}} = \frac{1}{K}\sum_{k=1}^{K}\frac{1}{D_k}\sum_{d=1}^{D_k}\text{MSE}(d_{k,d},\hat{d}_{k,d}) + \frac{1}{K}\sum_{k=1}^{K}\text{MSE}(a_k,\hat{a}_k) + \text{MSE}(A_{\text{overall}},\hat{A}_{\text{overall}})
+\end{equation}
+
+其中 $\hat{d}_{k,d}$、$\hat{a}_k$ 和 $\hat{A}_{\text{overall}}$ 分别为维度可供性、环节可供性和整体可供性的真实标签（由专家标注或基于历史供给数据构造）。维度级监督信号确保维度评分的可靠性，为后续结果分析中按维度拆解各环节可供性强弱提供训练约束。
+
+\textbf{(2) 环节赋权正则化损失 $\mathcal{L}_{\text{reg}}$。}为促使各环节内部权重不过度集中于单一指标，引入熵正则化项：
+
+\begin{equation}
+\mathcal{L}_{\text{reg}} = -\frac{1}{K}\sum_{k=1}^{K}\sum_{i=1}^{m_k} w_{k,i}^{\text{dyn}}\log w_{k,i}^{\text{dyn}}
+\end{equation}
+
+最大化权重熵鼓励模型在环节内分散关注多维度指标，避免对单一指标的过拟合依赖。
+
+\textbf{(3) SHAP一致性引导损失 $\mathcal{L}_{\text{shap}}$。}在训练过程中，将SHAP计算的指标重要度与DWN权重进行对齐：
+
+\begin{equation}
+\mathcal{L}_{\text{shap}} = \frac{1}{K}\sum_{k=1}^{K}(1 - \rho_k^{\text{cons}})
+\end{equation}
+
+最小化 $\mathcal{L}_{\text{shap}}$ 等价于最大化各环节内 DWN 权重与 SHAP 贡献度的秩相关系数，使模型的注意力分配与统计归因保持一致。
+
+其中 $\lambda_1$ 和 $\lambda_2$ 为平衡各损失项的超参数，通过验证集网格搜索确定。
