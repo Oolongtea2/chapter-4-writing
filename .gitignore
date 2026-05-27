@@ -4,7 +4,7 @@
 
 # Temp / lock files
 ~$*.docx
-*_v2*
+~$*
 *- 副本*
 
 # Skills
